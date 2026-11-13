@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AI 私厨 · 阶段 8 异步任务与实时推送 · 验证页</title>
+<style>
+  body { font: 14px/1.6 "Microsoft YaHei", sans-serif; margin: 0; padding: 20px; background: #f6f8fa; color: #1f2328; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: #57606a; margin-bottom: 16px; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+  label { min-width: 74px; color: #57606a; }
+  input { padding: 6px 8px; border: 1px solid #d0d7de; border-radius: 6px; font-size: 13px; }
+  input.grow { flex: 1; min-width: 220px; }
+  button { padding: 6px 12px; border: 1px solid #d0d7de; background: #fff; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #f3f4f6; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+  button.primary:hover { background: #1a5fd0; }
+  #state { font-weight: 600; }
+  #state.open { color: #1a7f37; }
+  #state.closed { color: #d93025; }
+  #log { height: 320px; overflow: auto; background: #0d1117; color: #c9d1d9; border-radius: 8px; padding: 10px 12px; font: 12px/1.6 Consolas, monospace; white-space: pre-wrap; }
+  .hint { color: #57606a; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>AI 私厨 · 阶段 8 验证页</h1>
+  <div class="sub">Celery 异步任务 + WebSocket 实时推送 —— 提交长任务，任务跑完后右下角自动弹通知。</div>
+
+  <div class="card">
+    <div class="row">
+      <label>后端地址</label>
+      <input id="api" class="grow" value="http://127.0.0.1:9002">
+      <span class="hint">默认 9002；若用临时端口验证请改成对应端口</span>
+    </div>
+    <div class="row">
+      <label>账号</label>
+      <input id="user" value="stage8_demo">
+      <label style="min-width:auto">密码</label>
+      <input id="pass" type="password" value="stage8-demo-123">
+      <button id="btnReg">注册（已存在会失败，可忽略）</button>
+      <button id="btnLogin" class="primary">登录并连接</button>
+      <button id="btnClose">断开</button>
+    </div>
+    <div class="row">
+      <label>连接状态</label>
+      <span id="state" class="closed">未连接</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="btnReindex">① 提交 Milvus 重索引（high 队列）</button>
+      <button id="btnKg">② 提交图谱重建（default 队列）</button>
+      <button id="btnNutri">③ 提交营养报告（low 队列）</button>
+      <button id="btnPing">发心跳 ping</button>
+    </div>
+    <div class="hint">任务跑完会有右上角的<b>绿色成功提示</b>；失败是红色。日志区能看到 STARTED → SUCCESS 两条推送。</div>
+  </div>
+
+  <div class="card">
+    <div id="log"></div>
+  </div>
+
+<script src="js/ws.js"></script>
+<script>
+// ---- 小工具 ----
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setState(text, cls) { const s = $('state'); s.textContent = text; s.className = cls; }
+
+let token = '';
+const base = () => $('api').value.replace(/\/+$/, '');
+
+// ---- 登录（顺带把地址喂给 ws.js）----
+async function login() {
+  window.WS_BASE = base();
+  const username = $('user').value, password = $('pass').value;
+  const r = await fetch(base() + '/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!r.ok) { log('登录失败 HTTP ' + r.status + ' ' + (await r.text())); return; }
+  const data = await r.json();
+  token = data.access_token;
+  window.WS_TOKEN = token;
+  log('登录成功，token 前缀 ' + token.slice(0, 20) + '...');
+  Notify.connect();
+}
+
+async function register() {
+  window.WS_BASE = base();
+  const r = await fetch(base() + '/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: $('user').value, password: $('pass').value, email: $('user').value + '@demo.local' }),
+  });
+  log('注册 HTTP ' + r.status + '（409 = 已存在，正常）');
+}
+
+// ---- 提交任务 ----
+async function submit(path, body, label) {
+  const r = await fetch(base() + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) { log(label + ' 提交失败 HTTP ' + r.status + ' ' + (await r.text())); return; }
+  const data = await r.json();
+  log(label + ' 已提交 task_id=' + data.task_id + ' 队列=' + data.queue + ' 状态=' + data.status);
+}
+
+// ---- 订阅 WebSocket 事件 ----
+Notify.on((ev) => {
+  if (ev.type === 'status') {
+    if (ev.state === 'open') { setState('已连接', 'open'); log('WS 已连接'); }
+    else if (ev.state === 'closed') { setState('已断开', 'closed'); log('WS 关闭 code=' + ev.code); }
+    else if (ev.state === 'reconnecting') { setState('重连中（第 ' + ev.attempt + ' 次）', 'closed'); log('WS 将在 ' + ev.delay + 'ms 后重连'); }
+    else if (ev.state === 'error') { setState('出错', 'closed'); log('WS 错误：' + ev.message); }
+    return;
+  }
+  if (ev.type === 'task') {
+    const tag = ev.status === 'SUCCESS' ? '[OK]' : (ev.status === 'FAILURE' ? '[FAIL]' : '[..]');
+    log(tag + ' 推送 ' + ev.status + ' · ' + ev.name + ' · task_id=' + ev.task_id);
+    if (ev.result) log('   结果：' + JSON.stringify(ev.result));
+    if (ev.error) log('   错误：' + ev.error);
+    if (ev.status === 'SUCCESS') Notify.toast('任务完成：' + ev.name.split('.').pop() + '\n' + JSON.stringify(ev.result), 'success');
+    if (ev.status === 'FAILURE') Notify.toast('任务失败：' + ev.name.split('.').pop() + '\n' + ev.error, 'error');
+  }
+});
+
+// ---- 按钮绑定 ----
+$('btnReg').onclick = () => register().catch(e => log('注册异常 ' + e.message));
+$('btnLogin').onclick = () => login().catch(e => log('登录异常 ' + e.message));
+$('btnClose').onclick = () => { Notify.close(); setState('未连接', 'closed'); };
+$('btnReindex').onclick = () => submit('/tasks/reindex-milvus', { rebuild: true }, '重索引').catch(e => log('提交异常 ' + e.message));
+$('btnKg').onclick = () => submit('/tasks/rebuild-kg', { rebuild: false }, '图谱重建').catch(e => log('提交异常 ' + e.message));
+$('btnNutri').onclick = () => submit('/tasks/nutrition-report', { ingredients: ['鸡蛋 100克', '西兰花 200克'] }, '营养报告').catch(e => log('提交异常 ' + e.message));
+$('btnPing').onclick = () => log('心跳由 ws.js 每 25 秒自动发送 "ping"，服务端回 {"type":"pong"}；此处无需手动操作');
+
+// 支持用 ?api=http://127.0.0.1:9018 预填后端地址（方便换端口验证）
+const qs = new URLSearchParams(location.search);
+if (qs.get('api')) $('api').value = qs.get('api');
+if (qs.get('user')) $('user').value = qs.get('user');
+
+log('页面就绪。请先“注册”（首次）再“登录并连接”。');
+</script>
+</body>
+</html>

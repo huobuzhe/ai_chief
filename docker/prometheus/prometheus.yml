@@ -1,0 +1,87 @@
+# 阶段 7：Prometheus 抓取配置
+# 抓三个目标：后端 /metrics、Prometheus 自身（看自己的指标）、AlertManager
+global:
+  scrape_interval: 5s          # 全局拉取间隔（个人项目用短间隔方便实时看）
+  evaluation_interval: 5s      # 告警规则评估间隔
+  scrape_timeout: 3s
+
+rule_files:
+  - "alerts.yml"               # 告警规则单独维护
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # 后端 /metrics 端点（核心数据源）
+  - job_name: "ai_chief_backend"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9002"]
+        labels:
+          app: ai_chief
+          env: dev
+
+
+    # Celery worker 的 /metrics 端点（v3 阶段 8 新增）
+  # worker 跑在宿主机（不是容器），所以从容器里用 host.docker.internal 访问 9101
+  - job_name: "ai_chief_worker"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9101"]
+        labels:
+          app: ai_chief
+          component: celery_worker
+          env: dev
+
+  # ===== v3阶段9 新增：四个微服务各自的 /metrics =====
+  # 为什么要分开四个 job 而不是合并成一个：
+  # 每个 job 都带一个 service 标签， Grafana 上就能按 service 分组看
+  # "哪个服务最慢 / 哪个服务报错最多" —— 这正是微服务监控的分内之事。
+  # 这四个服务都跑在宿主机上（不是容器），所以统一用 host.docker.internal。
+  - job_name: "ai_chief_svc_user"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9121"]
+        labels:
+          app: ai_chief
+          service: user
+          env: dev
+
+  - job_name: "ai_chief_svc_recognizer"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9122"]
+        labels:
+          app: ai_chief
+          service: recognizer
+          env: dev
+
+  - job_name: "ai_chief_svc_recommender"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9123"]
+        labels:
+          app: ai_chief
+          service: recommender
+          env: dev
+
+  - job_name: "ai_chief_svc_chat"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:9124"]
+        labels:
+          app: ai_chief
+          service: chat
+          env: dev
+
+  # Prometheus 自身（看拉取 / TSDB / 自身资源指标）
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # AlertManager 自身
+  - job_name: "alertmanager"
+    static_configs:
+      - targets: ["alertmanager:9093"]

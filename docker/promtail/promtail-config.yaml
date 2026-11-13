@@ -1,0 +1,33 @@
+# 阶段 7：Promtail 抓 docker daemon JSON 日志推送到 Loki
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: docker
+          __path__: /var/lib/docker/containers/*/*log
+    pipeline_stages:
+      # docker JSON 日志 → JSON 解析 → 提取 label（container_name / level / logger / msg）
+      - docker: {}
+      - match:
+          selector: '{job="docker"}'
+          stages:
+            - json:
+                expressions:
+                  level: level
+                  logger: logger
+                  msg: msg
+                  trace_id: trace_id
+            - labels:
+                level:
+                logger:
+                trace_id:

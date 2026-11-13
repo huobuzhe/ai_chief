@@ -1,0 +1,109 @@
+_format_version: "3.0"
+_transform: true
+
+# ============================================================
+# AI 私厨 v3.0 阶段 9 —— Kong 声明式配置（DB-less 模式）
+# ============================================================
+# 文件放：docker/kong/kong.yml
+# 用法：Kong 容器以 KONG_DATABASE=off + KONG_DECLARATIVE_CONFIG=/etc/kong/kong.yml 启动，
+#       改完这个文件要 `docker compose restart kong`（或直接重建容器）才会生效。
+#
+# 🔴 三个最容易写错的地方（写错的表现各不相同，都很难查）：
+#   1. strip_path: true（默认值！）会把路径前缀吃掉 ——
+#      比如请求 /auth/login 会被转发成 /login，后端直接 404。
+#      我们的四个服务**自己就带 /auth、/kg 这些前缀**，所以必须写 strip_path: false。
+#   2. 用 url 简写时，Kong 会顺手把 path 设成 "/"，和 strip_path:false 配合才正确；
+#      如果同时再写一个 path 字段，两边打架，转发结果会出乎意料。
+#   3. host 必须写 host.docker.internal（Docker 给的"宿主机"专用域名），
+#      写 127.0.0.1 或 localhost 会连到 Kong 容器自己身上，表现为 502。
+# ============================================================
+
+# ---------- 全局插件：对每个进来的请求都生效 ----------
+plugins:
+  # 给每个请求发一个链路 ID。后端的 TraceIdMiddleware 会**沿用**这个 ID，
+  # 于是"Kong 日志 / user 服务日志 / chat 服务日志 / recognizer 服务日志"
+  # 里同一次请求都能用同一个 X-Trace-Id 串起来 —— 这就是链路追踪的最简形态。
+  # echo_downstream: true = 把生成的 ID 也回写给客户端，方便前端拿着 ID 报障。
+  - name: correlation-id
+    config:
+      header_name: X-Trace-Id
+      generator: uuid
+      echo_downstream: true
+
+# ---------- 四个后端服务 ----------
+services:
+  # ==================== ① user 服务（9121）====================
+  - name: svc-user
+    url: http://host.docker.internal:9121
+    routes:
+      - name: r-user
+        paths:
+          - /auth
+          - /users
+          - /tenants
+          - /admin
+          - /billing
+          - /cache
+        strip_path: false
+    plugins:
+      # 登录/注册是高频接口，容量给大一些
+      - name: rate-limiting
+        config:
+          minute: 600
+          policy: local
+
+  # ==================== ② recognizer 服务（9122）====================
+  - name: svc-recognizer
+    url: http://host.docker.internal:9122
+    routes:
+      - name: r-recognizer
+        paths:
+          - /oss
+        strip_path: false
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 300
+          policy: local
+  # 🟡 注意：/internal/nodes/* 是给 chat 服务内部调用的，
+  #    这里**故意不暴露**到网关上（外部猜到也调不到），
+  #    想调试就直接连 http://127.0.0.1:9122/internal/nodes/recognize。
+
+  # ==================== ③ recommender 服务（9123）====================
+  - name: svc-recommender
+    url: http://host.docker.internal:9123
+    routes:
+      - name: r-recommender
+        paths:
+          - /kg
+        strip_path: false
+    plugins:
+      - name: rate-limiting
+        config:
+          minute: 300
+          policy: local
+
+  # ==================== ④ chat 服务（9124）====================
+  - name: svc-chat
+    url: http://host.docker.internal:9124
+    routes:
+      - name: r-chat
+        paths:
+          - /chat
+          - /tasks
+        strip_path: false
+      # 🔴 WebSocket 单独一条 route。这里有两个坑：
+      #   1. 不要写 protocols: ["websocket"] —— Kong 3.x 已经移除这个值，
+      #      写了会直接报 "unknown type: websocket" 导致整个配置文件解析失败
+      #      （Kong 3.x 里 WS 就是普通 http 请求 + Upgrade 头，Kong 自动识别，不需要声明）。
+      #   2. 必须 strip_path: false —— 路径 /ws/notifications 要原样送到 chat 服务。
+      - name: r-chat-ws
+        paths:
+          - /ws
+        strip_path: false
+    plugins:
+      # 对话是大模型调用，最贵最慢，限流最严格
+      - name: rate-limiting
+        config:
+          minute: 120
+          policy: local

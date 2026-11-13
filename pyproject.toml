@@ -1,0 +1,60 @@
+[project]
+name = "ai-sichu"
+version = "2.0.0"
+description = "企业级 AI 私厨系统 - 多节点 Agent + RAG"
+readme = "README.md"
+authors = [
+    { name = "huobuzhe", email = "168328099+huobuzhe@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+
+dependencies = [
+    # ===== 基础框架 =====
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.30.0",
+    "python-dotenv>=1.0.1",                   # 修订：原 dotenv 改名
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.4.0",
+    "python-multipart>=0.0.9",
+    "numpy>=1.26.0",                          # 修订：新增，向量相似度需要
+    # ===== LangChain / LangGraph =====
+    "langchain>=1.0.0",                       # 修订：原版未列顶层 langchain
+    "langchain-openai>=1.6.2",
+    "langchain-tavily>=0.2.18",
+    "langgraph>=1.2.11",
+    "langgraph-checkpoint-sqlite>=3.1.1",     # 修订：保留，本地用
+    "langgraph-checkpoint-postgres>=2.0.0",   # 修订：新增，生产用
+    "langchain-postgres>=0.0.12",             # PGVector
+    # ===== 数据库（统一栈：psycopg2-binary + PG，含 LangGraph async 路径见 README）=====
+    "sqlalchemy>=2.0.30",
+    "psycopg2-binary>=2.9.9",                 # 修订：替代文档里与 asyncpg 并列的混乱
+    # 说明：当前方案统一走同步 SQLAlchemy 引擎；LangGraph async checkpoint 在阶段 7 单独配 psycopg3 async
+    # ===== 缓存 / 限流 =====
+    "redis>=5.0.7",
+    # ===== 安全 =====
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt<4.1",                             # 修订：锁版本避开 passlib 兼容坑
+    # ===== 基础设施 =====
+    "alibabacloud-oss-v2>=1.4.0",
+    "tenacity>=8.2.3",
+    # ===== 测试 =====
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.7",
+    "httpx>=0.27.0",
+    "oss2>=2.19.1",
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
+    "langchain-community>=0.4.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.16,<0.13.0"]
+build-backend = "uv_build"
+
+# 修订：删除 [project.scripts]，旧版 ai-sichu = "ai_sichu:main" 指向不存在的包
+# 启动方式改为：uv run uvicorn main:app --reload
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

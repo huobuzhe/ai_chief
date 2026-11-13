@@ -1,0 +1,49 @@
+# 阶段 7：Loki 单机模式（Loki 3.4）
+# 用法：由 docker-compose 以 -config.file=/etc/loki/loki-config.yaml 加载
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1          # 单机模式：告诉 Loki "副本之间怎么互相找"，填本机即可
+  path_prefix: /loki
+  storage:
+    filesystem:                     # 落盘存储（单机不需要对象存储）
+      chunks_directory: /loki/chunks     # 日志正文（压缩块）
+      rules_directory: /loki/rules       # 告警规则目录
+  replication_factor: 1             # 单副本（单机模式）
+  ring:
+    kvstore:
+      store: inmemory               # 成员信息存内存——单机足够
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb                   # 索引存储类型：tsdb
+      object_store: filesystem      #  这一行必须有！缺了就是 "object_store type ''" 报错
+      schema: v13                   # Loki 3.x 的 schema 版本
+      index:
+        prefix: index_
+        period: 24h                 # 每 24h 一个索引文件
+
+limits_config:
+  retention_period: 168h            # 日志保留 7 天（168h = 7 × 24）
+  ingestion_rate_mb: 16             # 单租户写入速率上限 16MB/s
+  ingestion_burst_size_mb: 24       # 突发上限 24MB
+  allow_structured_metadata: true   # 允许结构化元数据（Loki 3.x 建议开启）
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true           # 开启保留期清理（配合上面的 retention_period）
+  delete_request_store: filesystem  # 🔴 开启 retention 后必须指定"删数据时用哪个存储"
+
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-temp
+  ring:
+    kvstore:
+      store: inmemory

@@ -1,0 +1,97 @@
+<!--
+    frontend/index.html - AI 私厨前端主页面（阶段 5 全新单页应用）
+
+    与原 test.html 的关键差异：
+    - 单页应用：左侧历史侧栏 + 中央对话区 + 顶部用户条
+    - 登录注册 UI：调 /auth/register 与 /auth/login，token 存 localStorage
+    - 开发期 js/api.js 中 API_BASE 指向 http://127.0.0.1:8002（跨域白名单内），生产期走 Nginx 反代同源
+    - SSE 流式显示：fetch + reader + TextDecoder + marked.js 渲染 Markdown
+    - 图片上传：file → 后端 OSS 预签名 → PUT 到阿里云 → 拿到 URL → 喂给 /chat/stream
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 私厨 · 你的厨房助手</title>
+
+    <!-- 本地样式 -->
+    <link rel="stylesheet" href="css/style.css">
+
+    <!-- Markdown 渲染器（CDN，免费，本项目 4 阶段都未用过 npm 依赖，保持一致） -->
+    <!-- ✅ 同时备一份本地 fallback：断网时还能渲染（基础功能降级） -->
+    <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+</head>
+<body>
+    <!-- ========== 顶部用户条 ========== -->
+    <header id="topbar">
+        <div class="logo">🍳 AI 私厨</div>
+        <div id="user-area">
+            <!-- 未登录：显示登录/注册按钮 -->
+            <button id="btn-show-login" class="btn-primary">登录</button>
+            <!-- 已登录：显示用户名 + 登出 -->
+            <span id="user-info" class="hidden">
+                欢迎，<strong id="username"></strong>
+                <button id="btn-logout" class="btn-ghost">登出</button>
+            </span>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- ========== 左侧：历史会话侧栏 ========== -->
+        <aside id="sidebar">
+            <button id="btn-new-chat" class="btn-primary">＋ 新会话</button>
+            <h3>历史对话</h3>
+            <ul id="history-list">
+                <!-- JS 渲染：每条 li = 一个历史会话 -->
+            </ul>
+        </aside>
+
+        <!-- ========== 中央：对话区 ========== -->
+        <main id="chat-area">
+            <!-- 空状态：提示登录或开始对话 -->
+            <div id="empty-state">
+                <h1>👋 你好，我是你的 AI 私厨</h1>
+                <p>请先<button class="btn-link" onclick="document.getElementById('btn-show-login').click()">登录</button>，然后告诉我你冰箱里有什么食材。</p>
+                <p class="hint">支持文字描述，也可以直接上传图片让我识别。</p>
+            </div>
+
+            <!-- 对话消息流 -->
+            <div id="messages" class="hidden">
+                <!-- JS 渲染：每条消息 = .message.user / .message.assistant -->
+            </div>
+
+            <!-- 流式响应中的打字光标 -->
+            <div id="typing" class="hidden">▍</div>
+
+            <!-- 输入区 -->
+            <div id="input-area">
+                <input type="file" id="image-input" accept="image/*" hidden>
+                <button id="btn-upload" class="btn-ghost" title="上传图片">📷</button>
+                <textarea id="input-text" rows="2" placeholder="告诉我你有什么食材，或直接按回车发送（Shift+回车换行）"></textarea>
+                <button id="btn-send" class="btn-primary">发送</button>
+            </div>
+        </main>
+    </div>
+
+    <!-- ========== 登录/注册弹窗 ========== -->
+    <div id="auth-modal" class="modal hidden">
+        <div class="modal-content">
+            <span class="close" id="close-modal">×</span>
+            <h2 id="modal-title">登录</h2>
+            <input type="text" id="auth-username" autocomplete="username">
+            <input type="password" id="auth-password" autocomplete="current-password">
+            <button id="btn-submit-auth" class="btn-primary">登录</button>
+            <p class="switch-link">
+                还没有账号？<a id="link-to-register">立即注册</a>
+            </p>
+            <p id="auth-error" class="error"></p>
+        </div>
+    </div>
+
+    <!-- ========== 应用脚本 ========== -->
+    <script src="js/api.js"></script>
+    <script src="js/ui.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
