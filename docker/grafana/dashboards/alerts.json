@@ -1,0 +1,67 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [
+    {"title": "AlertManager UI", "type": "link", "url": "http://127.0.0.1:9093", "targetBlank": true, "icon": "external link", "tooltip": "打开 AlertManager 查看告警详情"}
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "活跃告警数（firing）",
+      "type": "stat",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
+      "targets": [
+        {"expr": "count(ALERTS{alertstate=\"firing\"})", "refId": "A", "instant": true}
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 1}, {"color": "red", "value": 2}]}
+        },
+        "overrides": []
+      },
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "colorMode": "background", "graphMode": "none", "textMode": "auto"}
+    },
+    {
+      "id": 2,
+      "title": "告警明细",
+      "type": "table",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 10, "w": 16, "x": 8, "y": 0},
+      "targets": [
+        {"expr": "ALERTS", "refId": "A", "instant": true, "format": "table"}
+      ],
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "options": {"showHeader": true, "footer": {"show": false}}
+    },
+    {
+      "id": 3,
+      "title": "告警状态时间线（firing / pending 数量）",
+      "type": "timeseries",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 10},
+      "targets": [
+        {"expr": "count by (alertstate) (ALERTS)", "legendFormat": "{{alertstate}}", "refId": "A"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "short", "custom": {"drawStyle": "steps", "lineWidth": 1, "fillOpacity": 20}}, "overrides": []},
+      "options": {"legend": {"displayMode": "list", "placement": "bottom"}, "tooltip": {"mode": "multi"}}
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["ai_chief", "stage7"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "AI Chief · 告警统计",
+  "uid": "ai_chief_alerts",
+  "version": 1,
+  "weekStart": ""
+}

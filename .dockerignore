@@ -1,0 +1,16 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+.env
+frontend/
+docker/
+!docker/requirements.prod.txt
+
+docs/
+db/
+*.md
+test.html
+zhongduan_qidong*
+.coverage
+.pytest_cache/

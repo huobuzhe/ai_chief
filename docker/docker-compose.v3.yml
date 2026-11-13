@@ -1,0 +1,249 @@
+# AI 私厨 v3.0 - 独立基础设施（阶段 1）
+# 只起 pgvector + redis 两个容器，与 v2.0 的容器彻底隔离：
+#   - 不同容器名（ai_chief_* vs ai_sichu_*）
+#   - 不同宿主机端口（5433/6380 vs 5432/6379）
+#   - 不同数据卷（ai_chief_* vs ai_sichu_*）
+# 用法（在项目根目录执行）：
+#   起容器：docker compose -f docker/docker-compose.v3.yml up -d
+#   看状态：docker compose -f docker/docker-compose.v3.yml ps
+#   停止：  docker compose -f docker/docker-compose.v3.yml stop
+#   删除（数据卷保留）：docker compose -f docker/docker-compose.v3.yml down
+
+# 固定项目名为 ai_chief：无论从哪个目录执行，都不会和 v2.0 的容器互相覆盖
+# （不写 name 时，compose 默认用"当前目录名"当项目名，两个项目共用一个项目名就会打架）
+name: ai_chief
+
+services:
+  pgvector:
+    # 与 v2.0 同一个镜像（本地已有，无需重新拉取）
+    image: registry.cn-hangzhou.aliyuncs.com/fastgpt/pgvector:v0.7.0
+    container_name: ai_chief_pgvector          # 容器名与 v2.0 区分开
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_sichu                  # 库名/账号沿用 v2.0，代码零改动
+      POSTGRES_PASSWORD: ai_sichu
+      POSTGRES_DB: ai_sichu
+    ports:
+      - "5433:5432"                            # 宿主机 5433 -> 容器内 5432
+    volumes:
+      - ai_chief_pgdata:/var/lib/postgresql/data   # v3 独立数据卷
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_sichu -d ai_sichu"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine   # DaoCloud 源，本地已有
+    container_name: ai_chief_redis            # 容器名与 v2.0 区分开
+    restart: unless-stopped
+    ports:
+      - "6380:6379"                            # 宿主机 6380 -> 容器内 6379
+    volumes:
+      - ai_chief_redisdata:/data               # v3 独立数据卷
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  neo4j:
+    image: docker.m.daocloud.io/library/neo4j:5-community   # DaoCloud 源（镜像已在本地，无需重拉）
+    container_name: ai_chief_neo4j           # 容器名沿用 ai_chief_* 前缀
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/ai_chief_kg          # 账号/密码，与 config.py 的默认值一致
+      NEO4J_server_memory_heap_max__size: 512m     # 堆内存上限（个人项目够用）
+      NEO4J_server_memory_pagecache_size: 128m     # 图数据缓存（216 节点绰绰有余）
+    ports:
+      - "7474:7474"                          # HTTP：浏览器里看图的 Neo4j Browser
+      - "7687:7687"                          # Bolt：代码查询用的协议端口
+    volumes:
+      - ai_chief_neo4jdata:/data             # v3 独立数据卷（建图结果重启不丢）
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ai_chief_kg 'RETURN 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1   # DaoCloud 源（轻量、支持挂载自定义配置）
+    container_name: ai_chief_pgbouncer                     # 沿用 ai_chief_* 命名前缀
+    restart: unless-stopped
+    depends_on:
+      pgvector:
+        condition: service_healthy                          # 等 PG 健康检查过了再起
+    ports:
+      - "9432:6432"                                         # 宿主机 9432 -> 容器内 6432
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro   # 挂载配置（ro=只读）
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro     # 挂载账号表
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.14                       # quay.io 直连可拉通（已验证）；etcd 不在 DaoCloud 白名单，别改成 daocloud
+    container_name: ai_chief_etcd                             # Milvus 的"元数据账本"
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision                     # 按"版本号"自动压缩旧数据
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"                  # 保留最近 1000 个版本
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"                  # 后端存储配额 4GB
+      ETCD_SNAPSHOT_COUNT: "50000"                            # 每 5 万次写做一次快照
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - ai_chief_etcddata:/etcd                               # 元数据持久化（重启不丢）
+
+  minio:
+    image: docker.1panel.live/minio/minio:RELEASE.2025-09-07T16-13-09Z   # pin 住（与 :latest 同一份镜像）；1panel 源只代最新这一版，所以选它折中
+    container_name: ai_chief_minio                            # Milvus 的"向量文件仓库"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: minioadmin                             # 本地默认账密（浏览器控制台也用它）
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9111:9001"                                           # 只暴露控制台；数据端口 9000 仅容器内用
+    volumes:
+      - ai_chief_miniodata:/minio_data                        # 向量数据文件持久化
+
+  milvus:
+    image: docker.m.daocloud.io/milvusdb/milvus:v2.4.17      # standalone 单机模式；Docker Hub 匿名拉取被限流，改走 DaoCloud 源
+    container_name: ai_chief_milvus
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379                               # 去哪读元数据
+      MINIO_ADDRESS: minio:9000                               # 去哪存数据文件
+    ports:
+      - "19530:19530"                                         # gRPC：应用检索用
+      - "9191:9091"                                           # HTTP：健康检查/指标
+    depends_on:
+      - etcd
+      - minio
+    volumes:
+      - ai_chief_milvusdata:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s                                       # Milvus 启动慢，给足 90 秒再判健康
+    # ============ v3阶段7 可观测栈 ============
+
+  prometheus:
+    image: docker.1panel.live/prom/prometheus:v2.55.1
+    container_name: ai_chief_prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - ai_chief_promdata:/prometheus
+
+  grafana:
+    image: docker.1panel.live/grafana/grafana:11.3.1
+    container_name: ai_chief_grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+    ports:
+      - "3300:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ai_chief_grafanadata:/var/lib/grafana
+
+  alertmanager:
+    image: docker.1panel.live/prom/alertmanager:v0.27.0
+    container_name: ai_chief_alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ai_chief_alertmgrdata:/alertmanager
+
+  loki:
+    image: docker.1panel.live/grafana/loki:3.4.0
+    container_name: ai_chief_loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/loki-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - ai_chief_lokidata:/loki
+
+  promtail:
+    image: docker.1panel.live/grafana/promtail:3.4.0
+    container_name: ai_chief_promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/promtail-config.yaml
+    volumes:
+      - ./promtail/promtail-config.yaml:/etc/promtail/promtail-config.yaml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  # ==================== v3阶段9 新增：Kong API 网关 ====================
+  # DB-less 模式：不连数据库，路由表全在 docker/kong/kong.yml 这一个文件里。
+  # 好处：少起一个 Postgres 容器（省内存），且配置可进 git、可 code review。
+  kong:
+    # 用 1panel 镜像源（Docker Hub 直连在国内容易 EOF）
+    image: docker.1panel.live/library/kong:3.7
+    container_name: ai_chief_kong
+    restart: unless-stopped
+    environment:
+      # 🔴 DATABASE=off 是 DB-less 模式的开关，少了这行 Kong 会去找 Postgres 然后启动失败
+      KONG_DATABASE: "off"
+      # 声明式配置文件路径（容器内路径）
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      # 代理端口 8000 映射到宿主机 9100 —— 外部只该访问 9100
+      KONG_PROXY_LISTEN: 0.0.0.0:8000
+      # Admin API 默认只听 127.0.0.1，这里改成 0.0.0.0 才能从宿主机访问
+      KONG_ADMIN_LISTEN: 0.0.0.0:8001
+      # 日志打到 stdout/stderr，这样 Promtail 才能采集（阶段 7 的日志栈直接复用）
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      # 本机开发只有一个网关，起 1 个 worker 足够（默认会按 CPU 核数起，费内存）
+      KONG_NGINX_WORKER_PROCESSES: "1"
+    ports:
+      - "9100:8000"      # 统一入口（外部只访问它）
+      - "9105:8001"      # Admin API（DB-less 下只读，用来查路由表）
+    volumes:
+      # 🔴 必须挂**单个文件**而不是目录。源文件不存在时 Docker 会自动建一个同名目录顶替，
+      #    然后报 "not a directory: Are you trying to mount a directory onto file"。
+      #    所以顺序上必须"先写 kong.yml，再起容器"。
+      - ./kong/kong.yml:/etc/kong/kong.yml:ro
+    extra_hosts:
+      # 让容器内能用 host.docker.internal 访问到宿主机上的四个服务
+      - "host.docker.internal:host-gateway"
+
+
+volumes:
+  ai_chief_pgdata:
+  ai_chief_redisdata:
+  ai_chief_neo4jdata:      #  v3阶段3 新增
+  ai_chief_etcddata:      # v3阶段6 新增
+  ai_chief_miniodata:     # v3阶段6 新增
+  ai_chief_milvusdata:    # v3阶段6 新增
+  ai_chief_promdata:        # v3阶段7 新增
+  ai_chief_grafanadata:     # v3阶段7 新增
+  ai_chief_alertmgrdata:    # v3阶段7 新增
+  ai_chief_lokidata:        # v3阶段7 新增

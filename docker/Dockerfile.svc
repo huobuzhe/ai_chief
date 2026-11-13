@@ -1,0 +1,100 @@
+# =============================================================================
+# docker/Dockerfile.svc —— 阶段 10 生产级服务镜像
+# =============================================================================
+# 和开发机上的跑法有什么不同（一句话一个理由）：
+#   ① 用 gunicorn 起多 worker    —— 单进程 uvicorn 一个进程扛不住多核，
+#                                    且进程挂了整个服务就没了；gunicorn 会自愈重启 worker
+#   ② worker 类是 UvicornWorker  —— 我们的服务是 FastAPI（ASGI，异步），
+#                                    必须配 ASGI worker 才能真的并发，用同步 worker 会把
+#                                    异步全堵死，/chat/stream 这种长连接直接卡成串行
+#   ③ 加 HEALTHCHECK             —— 没有它，容器"起来了但应用没起来"时
+#                                    docker ps 显示 Up，只有用户报障才发现
+#   ④ 用非 root 用户跑           —— 镜像被拖库时，root 权限等于把整台机器交出去
+#   ⑤ --workers 用环境变量传     —— 每个服务的最优 worker 数不一样，
+#                                    写死在 Dockerfile 里就得为每个服务建一个镜像
+#
+# 为什么不能在本机 Windows 上试这套命令：
+#   gunicorn 依赖 fcntl / os.fork，这两个 Windows 没有。
+#   在 Windows 里 import gunicorn 会直接 ModuleNotFoundError: No module named 'fcntl'。
+#   所以它只能在容器里跑——这也是"生产镜像"和"本机开发"必须分开的原因。
+#
+# 构建（在项目根目录执行）：
+#   docker build -f docker/Dockerfile.svc -t ai-chief-svc:prod .
+# 验证（起起来看 /health）：
+#   docker run --rm -d --name svc-smoke -p 9131:9121 \
+#     -e APP_MODULE=services.user.main:app -e WEB_WORKERS=2 ai-chief-svc:prod
+#   curl http://127.0.0.1:9131/health
+# =============================================================================
+FROM docker.m.daocloud.io/library/python:3.13-slim
+# 🔴 为什么 FROM 写的是 DaoCloud 完整地址，而不是官方的 `python:3.13-slim`：
+#    本机 Docker Desktop 配的 Registry Mirrors（USTC / 163 / 百度）当前全部连不上，
+#    写官方地址会在这里直接失败：
+#        failed to do request: Head "https://docker.mirrors.ustc.edu.cn/v2/...": EOF
+#    DaoCloud 是项目 docker-compose.v3.yml 里一直在用的源（redis 就走的它），
+#    本地已有这个基础镜像的缓存，用它既能构建成功、又不引入新的外部依赖。
+#    换机器构建如果提示找不到镜像，把这里换成对方能访问的等价镜像即可，内容不受影响。
+
+WORKDIR /app
+
+# PYTHONUTF8=1        容器默认是 ASCII（POSIX locale），中文日志/菜谱数据一打印就 UnicodeEncodeError
+# PYTHONDONTWRITEBYTECODE=1  不生成 .pyc：容器只读也用不上，还能让镜像小一点
+# PIP_INDEX_URL       国内源，不然拉依赖要十几分钟
+ENV PYTHONUTF8=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 🔴 这里**不装 curl**（很多教程会 apt-get install curl，但那是给自己挖坑）：
+#    ① 容器内访问 deb.debian.org 常年 502/DNS 失败（实测 trixie 源直接 Bad Gateway），
+#       一旦 apt 装不上，整条 docker build 当场失败，后面所有步骤都跑不到；
+#    ② slim 镜像自带 Python，用 Python 的 urllib 做健康检查完全够用，
+#       多装一个二进制换一份网络依赖，不划算。
+#    所以健康检查改用下面 HEALTHCHECK 里的一行 Python。
+
+# 先只拷依赖清单、再装依赖：Docker 按层缓存，
+# 这样"改代码重新构建"时这一层能用缓存，不用每次重装一遍依赖。
+# 🔴 两份都要拷、且分两行写：`COPY a b ./x` 这种"多源到单目标"的写法，
+#    目标不是目录时会直接报 must be a directory，构建当场失败。
+COPY requirements.txt ./requirements.txt
+COPY docker/requirements.prod.txt ./requirements.prod.txt
+RUN pip install --no-cache-dir -r requirements.prod.txt
+
+# 再拷代码（顺序不能反：依赖在前、代码在后，改代码才不会触发依赖重装）
+COPY app_my ./app_my
+COPY services ./services
+COPY main.py ./main.py
+
+# 非 root 运行：容器被攻破时把损失限制在这个用户能碰到的范围内
+RUN useradd --create-home --uid 1000 appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+# 这两个参数在 docker run / compose 里覆盖，决定了"跑哪个服务"和"起几个 worker"
+ENV APP_MODULE=services.user.main:app \
+    WEB_WORKERS=2 \
+    WEB_PORT=9121 \
+    WEB_TIMEOUT=120
+
+EXPOSE 9121
+
+# 健康检查：每 30 秒打一次自己的 /health，连续 3 次失败才标记 unhealthy。
+# 用 Python 的 urllib 而不是 curl：
+#   slim 镜像里没有 curl（为了不装它我们已经删掉了整条 apt-get），
+#   而 Python 一定有，urllib.request.urlopen 就是一次最朴素的 HTTP GET。
+#   退出码 0 = 健康；urlopen 对连接失败/非 2xx 都会抛异常，
+#   异常会让 python 进程非 0 退出，正好被 Docker 判成 unhealthy。
+# start_period=40s 是启动宽限期：服务启动要连数据库、建连接池，
+# 不设宽限期的话启动慢一点就会被判 unhealthy，compose 会不停地重启它。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('WEB_PORT','9121')+'/health',timeout=4).read()" || exit 1
+
+# 用 shell 形式（不是 exec 形式）写 CMD，
+# 因为要展开 ${APP_MODULE} 这些环境变量；exec 形式的 JSON 数组不会做变量替换。
+CMD gunicorn "${APP_MODULE}" \
+      -k uvicorn.workers.UvicornWorker \
+      --workers "${WEB_WORKERS}" \
+      --bind "0.0.0.0:${WEB_PORT}" \
+      --timeout "${WEB_TIMEOUT}" \
+      --graceful-timeout 30 \
+      --access-logfile - \
+      --error-logfile -

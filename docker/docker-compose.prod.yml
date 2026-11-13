@@ -1,0 +1,200 @@
+# =============================================================================
+# docker/docker-compose.prod.yml —— 阶段 10 生产级编排（4 个服务 + Kong 网关）
+# =============================================================================
+# 和"开发/压测时怎么跑"的区别：
+#   开发/压测：在宿主机用 `uvicorn main:app --port 9121` 直接起（改代码热重载方便）
+#   生产    ：每个服务一个容器，gunicorn 起多 worker，挂健康检查、资源上限、日志轮转
+#
+# 基础设施（PostgreSQL 5433 / Redis 6380 / Neo4j / Milvus / 监控栈）**不在这里**，
+# 沿用 docker/docker-compose.v3.yml 起的那批容器，理由是沿用项目一贯的原则
+# "用到哪个阶段起哪个容器"，而且基础设施本身已经有数据卷、不该和应用的生命周期绑死。
+# 应用容器通过 host.docker.internal 访问宿主机上的基础设施（和 Kong 现在访问服务的方式一致）。
+#
+# 用法（在项目根目录 F:\pycharm_aiprogram\ai_chief 执行）：
+#   1) 先确认基础设施在跑：docker compose -f docker/docker-compose.v3.yml ps
+#   2) 构建镜像：          docker compose -f docker/docker-compose.prod.yml build
+#   3) 起应用：            docker compose -f docker/docker-compose.prod.yml up -d
+#   4) 看健康状态：        docker compose -f docker/docker-compose.prod.yml ps
+#   5) 停应用：            docker compose -f docker/docker-compose.prod.yml down
+#
+# 🔴 第一次 up 之前必须有一个 .env 文件（JWT_SECRET、DASHSCOPE_API_KEY 等都从它读）。
+#    没有 .env 时容器会起不来，日志里是 pydantic 的 ValidationError
+#    "JWT_SECRET 仍为默认值 'change-me-in-production'"。
+# =============================================================================
+
+name: ai_chief_prod
+
+# 四个应用服务共用的启动骨架，用 YAML 锚点复用（改一处、四个服务都生效）
+x-svc-common: &svc-common
+  # 🔴 image 必须写：不带它时 compose 会**自己现场构建一份**名字类似 ai_chief_prod-svc-user 的镜像，
+  #    而 §15.1 用 docker build -t 构建的 ai-chief-svc:prod 根本不会被用上——
+  #    结果是"你 build 了新镜像、容器却还跑在 compose 自己构建的旧镜像里"，改了依赖也不生效。
+  #    写上 image 后：compose 直接用这个标签的镜像，本地没有它才会自己 build。
+  image: ai-chief-svc:prod
+  build:
+    context: ..                          # 构建上下文 = 项目根目录（要能 COPY app_my / services / main.py）
+    dockerfile: docker/Dockerfile.svc
+  # 🔴 覆盖 .env 里"宿主机视角"的连接串（localhost → host.docker.internal）：
+  #    .env 的 localhost 是给宿主机 uvicorn 用的；容器里 localhost 指容器自己，
+  #    连不上宿主机端口上的 PgBouncer/Redis/Milvus —— 表现为接口 500。
+  #    env_file 是列表，**后面的文件覆盖前面的同名变量**（compose v2 规范），
+  #    所以必须把覆盖层放在列表第二位。写在各服务的 environment 里会被 YAML 锚点
+  #    浅合并丢掉（服务自己的 environment 段会整个替换锚点的同名 key），不要那么写。
+  env_file:
+    - ../.env                            # 先加载全量配置（宿主机视角）
+    - ./env.prod-override                # 再用容器视角覆盖连接串（见 docker/env.prod-override）
+  restart: unless-stopped                # 崩了自动拉起；手动 stop 就不起来（不会和人工操作抢）
+  # 让容器能访问"宿主机"：Linux 上 Docker 20.10+ 用这个特殊值把宿主机 IP 注入 /etc/hosts
+  # 我们的 DB / Redis / Neo4j / Milvus 都跑在宿主机端口上（5433 / 6380 / 7687 / 19530），
+  # 没有这一行，容器里的 127.0.0.1 指的是它自己，连数据库一律 Connection refused。
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  # 日志轮转：不设的话，一个跑几周的容器日志能把系统盘写满
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"                    # 单个日志文件超过 10MB 就切新文件
+      max-file: "3"                      # 最多留 3 个，总共封顶 30MB
+  # 资源上限：一个服务内存泄漏时不至于把整台机器拖死
+  mem_limit: 768m
+  cpus: 1.0
+
+services:
+  # ==================== ① user 服务 ====================
+  svc-user:
+    <<: *svc-common
+    container_name: ai_chief_prod_user
+    environment:
+      APP_MODULE: services.user.main:app   # 决定容器里跑哪份代码（同一个镜像靠它复用给 4 个服务）
+      WEB_PORT: "9121"
+      WEB_WORKERS: "2"                     # 2 worker：登录是 bcrypt 计算（CPU 密集），多核才有收益
+      # 生产环境不再用 mock——压测才打桩，压测完这个开关必须留在 false
+      MOCK_LLM: "false"
+    ports:
+      - "9121:9121"
+    healthcheck:
+      # 用 Python urllib 探活，不用 curl：镜像里没装 curl（见 Dockerfile.svc 里的说明）
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9121/health',timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s                    # 启动宽限：建连接池、连 Neo4j 都要时间
+      retries: 3
+
+  # ==================== ② recognizer 服务 ====================
+  svc-recognizer:
+    <<: *svc-common
+    container_name: ai_chief_prod_recognizer
+    environment:
+      APP_MODULE: services.recognizer.main:app
+      WEB_PORT: "9122"
+      WEB_WORKERS: "2"
+      MOCK_LLM: "false"
+    ports:
+      - "9122:9122"
+    healthcheck:
+      # 用 Python urllib 探活，不用 curl：镜像里没装 curl（见 Dockerfile.svc 里的说明）
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9122/health',timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # ==================== ③ recommender 服务 ====================
+  svc-recommender:
+    <<: *svc-common
+    container_name: ai_chief_prod_recommender
+    environment:
+      APP_MODULE: services.recommender.main:app
+      WEB_PORT: "9123"
+      WEB_WORKERS: "3"                     # 3 worker：图谱 + 向量检索是 IO 密集，
+                                           # 多开一点 worker 能把等待时间重叠掉（压测实测见报告）
+      MOCK_LLM: "false"
+    ports:
+      - "9123:9123"
+    healthcheck:
+      # 用 Python urllib 探活，不用 curl：镜像里没装 curl（见 Dockerfile.svc 里的说明）
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9123/health',timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # ==================== ④ chat 服务 ====================
+  svc-chat:
+    <<: *svc-common
+    container_name: ai_chief_prod_chat
+    environment:
+      APP_MODULE: services.chat.main:app
+      WEB_PORT: "9124"
+      WEB_WORKERS: "3"
+      # 🔴 生产必须 remote：chat 服务要**跨服务调用**前三个服务，
+      #    local 模式会退化成"在自己进程里跑全部节点"，等于白拆
+      SPLIT_MODE: "remote"
+      MOCK_LLM: "false"
+      # 对话是流式长连接：单请求可能几十秒，gunicorn 默认 30s 超时会把它掐断
+      WEB_TIMEOUT: "120"
+    ports:
+      - "9124:9124"
+    healthcheck:
+      # 用 Python urllib 探活，不用 curl：镜像里没装 curl（见 Dockerfile.svc 里的说明）
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:9124/health',timeout=4).read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    depends_on:
+      # depends_on 只保证"启动顺序"，不保证"对面已经能服务"——
+      # 真正保险靠 healthcheck + 重试，chat 侧的 ServiceClient 自带熔断器（阶段 9 加的）
+      svc-user:
+        condition: service_started
+      svc-recognizer:
+        condition: service_started
+      svc-recommender:
+        condition: service_started
+
+  # ==================== ⑤ Kong 网关 ====================
+  # 复用阶段 9 的 kong.yml（5 条路由 / 4 个 service / 限流插件），一个字都不用改：
+  # 服务从"宿主机进程"变成"容器"，但端口没变，Kong 里的 host.docker.internal:9121 照样能通。
+  kong:
+    # 🔴 写国内源的完整地址 + 与本地已缓存的版本号一致（3.7）：
+    #    官方 `kong:3.9-ubuntu` 在本机会去 Docker Hub 拉，
+    #    而本机配的三个 Registry Mirrors（USTC/163/百度）当前都连不上，
+    #    结果是 compose up 卡在 "pulling kong" 最后失败。
+    #    换成 DaoCloud 源 + 本地已有的 3.7，直接命中缓存，秒起。
+    #    （阶段 9 的 docker-compose.v3.yml 里用的也是这个镜像，版本保持一致。）
+    image: docker.m.daocloud.io/library/kong:3.7
+    container_name: ai_chief_prod_kong
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"                                  # DB-less：配置全在 yaml 里，不额外起 Postgres
+      KONG_DECLARATIVE_CONFIG: /etc/kong/kong.yml
+      KONG_PROXY_LISTEN: "0.0.0.0:9100"                     # 用户入口
+      KONG_ADMIN_LISTEN: "0.0.0.0:9101"                     # 管理口（容器内）
+      # 🔴 必须限制 worker 数：Kong 默认一个 CPU 核起一个 worker（本机 13 核 = 13 个），
+      #    512m 内存限制下直接被 OOM 杀（日志：worker process ... exited on signal 9），
+      #    表现为端口在监听但请求全部超时。2 个 worker 对网关绰绰有余。
+      KONG_NGINX_WORKER_PROCESSES: "2"
+    volumes:
+      - ./kong/kong.yml:/etc/kong/kong.yml:ro               # ro = 只读挂载，容器改不了配置
+    ports:
+      - "9100:9100"                                         # 网关入口（和开发时同一个端口）
+      - "9105:9101"                                         # 管理口映射到 9105（避开 9101 已被 worker metrics 占用）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    mem_limit: 512m
+    healthcheck:
+      # Kong 自带 kong health 子命令，直接用，不需要额外装东西
+      test: ["CMD", "kong", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      svc-user:
+        condition: service_started
+      svc-chat:
+        condition: service_started

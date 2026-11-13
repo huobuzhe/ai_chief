@@ -1,0 +1,86 @@
+# 阶段 7：告警规则（4 条）
+# 命名约定：<level>_<service>_<signal>。level 与 AlertManager 路由对应（infra=warnings、warnings=debug）
+groups:
+  - name: ai_chief_alerts
+    interval: 30s              # 评估间隔（比全局的 5s 长——告警不需要秒级判）
+    rules:
+
+      # 1) 5xx 错误率 > 5% 持续 2 分钟
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5xx"}[5m])) /
+          sum(rate(http_requests_total[5m])) > 0.05
+        for: 2m
+      # - alert: HighErrorRate
+      #   expr: sum(rate(http_requests_total{status=~"5xx"}[1m])) > 0.01
+      #   for: 30s
+
+
+        labels:
+          severity: warning
+          service: ai_chief
+        annotations:
+          summary: "5xx 错误率超过 5%（当前 {{ $value | $labels.value }}）"
+          description: "{{ $labels.path }} 路径 5xx 错误率 {{ $value | humanizePercentage }}，请查日志。"
+
+      # 2) P99 延迟 > 3 秒持续 5 分钟
+      - alert: HighP99Latency
+        expr: |
+          histogram_quantile(0.99, sum by (path) (rate(http_request_duration_seconds_bucket[5m]))) > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: ai_chief
+        annotations:
+          summary: "P99 延迟超过 3s（{{ $labels.path }}：{{ $value }}s）"
+          description: "请求路径 {{ $labels.path }} 的 P99 延迟为 {{ $value | humanizeDuration }}，持续 5 分钟。"
+
+      # 3) Token 成本小时环比 ≥ 3 倍
+      - alert: TokenCostSpike
+        expr: |
+          (sum(rate(llm_cost_cny_total[1h])) * 3600) /
+          (sum(rate(llm_cost_cny_total[1h] offset 1h)) * 3600 + 1) > 3
+        for: 5m
+        labels:
+          severity: warning
+          service: ai_chief
+        annotations:
+          summary: "Token 成本小时环比突增 3x"
+          description: "当前 1 小时 LLM 成本 = 前 1 小时 LLM 成本的 3 倍以上，可能 LLM 路由异常或被刷。"
+
+      # 4) 配额耗尽（与阶段 4 QuotaMiddleware 联动）
+      - alert: QuotaExhausted
+        expr: llm_quota_used_ratio > 0.95
+        for: 1m
+        labels:
+          severity: critical
+          service: ai_chief
+        annotations:
+          summary: "租户 {{ $labels.tenant_id }} LLM 配额耗尽 95%"
+          description: "租户 {{ $labels.tenant_id }} 已用 95% LLM 配额，请通知租户或临时上调限额。"
+      
+      # 5) Celery 任务失败（v3 阶段 8 新增）
+      # 任何任务在 5 分钟窗口内出现失败，立即告警——长任务失败通常意味着外部依赖（Milvus/Neo4j/DashScope）出问题
+      - alert: CeleryTaskFailure
+        expr: increase(celery_task_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: ai_chief
+          component: celery_worker
+        annotations:
+          summary: "Celery 任务 {{ $labels.task }} 执行失败"
+          description: "任务 {{ $labels.task }} 在最近 5 分钟内出现失败，请查 worker 终端日志确认原因。"
+
+      # 6) 队列积压（v3 阶段 8 新增）
+      # 队列深度持续 > 10，说明 worker 处理不过来（任务太长/太少 worker/死循环）
+      - alert: CeleryQueueBacklog
+        expr: celery_queue_depth > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: ai_chief
+          component: celery_worker
+        annotations:
+          summary: "队列 {{ $labels.queue }} 积压（当前 {{ $value }} 条）"
+          description: "队列 {{ $labels.queue }} 待处理任务持续超过 10 条，请检查 worker 是否在正常消费。"

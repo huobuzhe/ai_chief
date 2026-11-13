@@ -1,0 +1,13 @@
+# 阶段 7：AlertManager 配置
+# 本地开发：默认静默（不响铃不打扰）；告警写入到 alert.log 文件，给业务人员看
+route:
+  group_by: ["alertname", "service"]
+  group_wait: 10s
+  group_interval: 5m
+  repeat_interval: 3h
+  receiver: "local-file"
+
+receivers:
+  - name: "local-file"
+    # webhook_configs 在本地开发里发空列表——AlertManager 会写到 AM 自身的日志（alert.log）
+    webhook_configs: []

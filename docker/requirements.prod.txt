@@ -1,0 +1,23 @@
+# =============================================================
+# docker/requirements.prod.txt —— 生产镜像要装的依赖
+# =============================================================
+# 第一行的 -r requirements.txt 是 pip 的"继承"语法：
+#   把开发用的依赖清单整份继承过来，这里只补生产额外需要的。
+# 为什么不直接复制粘贴一份：
+#   两份清单会立刻开始漂移——哪天你往 requirements.txt 加了个包，
+#   生产的这份没有，镜像构建成功但运行时报 ModuleNotFoundError，
+#   而且是"只有容器里才会崩"，本机怎么测都测不出来。
+-r requirements.txt
+
+# gunicorn：生产级 WSGI/ASGI 服务器。
+#   开发时用 `uvicorn main:app`（单进程、改代码热重载方便）；
+#   生产用 gunicorn 管多个 uvicorn worker（多核 + 进程挂了自动拉起）。
+#   版本锁 23.0.0：不锁的话不同时间构建的镜像里 gunicorn 版本可能不一样，
+#   出问题时"本机好的、测试环境坏的"最难查。
+gunicorn==23.0.0
+
+# prometheus_client：运行时依赖（app_my/middleware/metrics.py 直接 import 它）。
+#   它没写进 requirements.txt，所以只在开发虚拟环境里装过；
+#   生产镜像构建时不会报错，但容器一启动 import 就崩、然后无限重启。
+#   版本锁 0.26.0，与开发虚拟环境保持一致。
+prometheus-client==0.26.0
